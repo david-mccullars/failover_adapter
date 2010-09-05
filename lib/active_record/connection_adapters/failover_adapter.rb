@@ -25,7 +25,6 @@ module ActiveRecord
     
       def initialize(*adapters)
         @adapters = adapters.flatten
-        @last_verification = Time.now.to_i
         @reconnect_timeout = DEFAULT_RECONNECT_TIMEOUT
       end
 
@@ -42,7 +41,7 @@ module ActiveRecord
       rescue
         false
       end
-    
+
       def requires_reloading?
         false
       end
@@ -59,20 +58,33 @@ module ActiveRecord
       def reset_runtime
         @adapters.inject(0.0) { |total, a| total += a.reset_runtime }
       end
-    
+
       private
-    
+
+      # Avoid calling active? a ridiculous number of times by only checking active?
+      # status once within @reconnect_timeout window
       def first_active_adapter
         now = Time.now.to_i
-        if (now - @last_verification) > @reconnect_timeout
-          @adapters.each { |a| a.reconnect! unless a.active? }
+        unless @first_active_adapter and (now - @last_verification) < @reconnect_timeout
+          @first_active_adapter = @adapters.detect do |a|
+            a.reconnect! unless active = a.active?
+            active
+          end
           @last_verification = now
         end
-        @adapters.detect &:active? or raise ActiveRecordError, "There are no active connections available."
+        @first_active_adapter or raise ActiveRecordError, "There are no active connections available."
       end
     
       def proxy_adapter_method(method, *args, &block)
-        first_active_adapter.send method, *args, &block
+        adapter = first_active_adapter
+        begin
+          adapter.send method, *args, &block
+        rescue Exception => e
+          # On failure, check to see if the adapter is even active.  If it isn't, try again on next active adapter.
+          raise e if adapter.active?
+          @first_active_adapter = nil
+          first_active_adapter.send method, *args, &block
+        end
       end
     
       # Load given adapter type(s) and mixin connect_with_failover.
@@ -81,13 +93,16 @@ module ActiveRecord
         types.flatten.map do |type|
           require klass = "active_record/connection_adapters/#{type}_adapter"
           klass.camelize.constantize.tap do |k|
-            k.class_eval do
-              def connect_with_failover
-                connect_without_failover
-              rescue Exception => e
-                @logger.error(e) if @logger
+            # Make sure and only patch once 
+            unless k.method_defined? :connect_with_failover
+              k.class_eval do
+                def connect_with_failover
+                  connect_without_failover
+                rescue Exception => e
+                  @logger.error(e) if @logger
+                end
+                alias_method_chain :connect, :failover
               end
-              alias_method_chain :connect, :failover
             end
           end
         end
