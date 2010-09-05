@@ -1,17 +1,9 @@
 module ActiveRecord
 
-  Base.class_eval do
+  class Base
 
     def self.failover_connection(config)
-      adapter_types = config[:failover_adapter].split(/[\s,]+/)
-      ActiveRecord::ConnectionAdapters::FailoverAdapter.create_adapter(adapter_types) do
-        config[:host].split(/[\s,]+/).zip(adapter_types).map do |host, type|
-          type ||= adapter_types.first
-          send "#{type}_connection", config.dup.merge(:host => host)
-        end
-      end.tap do |adapter|
-        adapter.reconnect_timeout = config[:failover_reconnect_timeout]
-      end
+      ActiveRecord::ConnectionAdapters::FailoverAdapter.establish_connection(config)
     end
 
   end
@@ -22,14 +14,11 @@ module ActiveRecord
 
       ADAPTER_NAME = 'Failover Adapter'.freeze
       DEFAULT_RECONNECT_TIMEOUT = 60
+      PROXY_ATTEMPTS = 2
     
-      def initialize(*adapters)
+      def initialize(adapters, reconnect_timeout=nil)
         @adapters = adapters.flatten
-        @reconnect_timeout = DEFAULT_RECONNECT_TIMEOUT
-      end
-
-      def reconnect_timeout=(timeout)
-        @reconnect_timeout = timeout.to_i if timeout
+        @reconnect_timeout = (reconnect_timeout || DEFAULT_RECONNECT_TIMEOUT).to_i
       end
 
       def adapter_name #:nodoc:
@@ -74,17 +63,36 @@ module ActiveRecord
         end
         @first_active_adapter or raise ActiveRecordError, "There are no active connections available."
       end
-    
+
+      # Proxies an adapter method call to the first active adapter.  If that fails,
+      # a subsequent attempts will be made on the next active adapter.
       def proxy_adapter_method(method, *args, &block)
-        adapter = first_active_adapter
-        begin
-          adapter.send method, *args, &block
-        rescue Exception => e
-          # On failure, check to see if the adapter is even active.  If it isn't, try again on next active adapter.
-          raise e if adapter.active?
-          @first_active_adapter = nil
-          first_active_adapter.send method, *args, &block
+        (1..PROXY_ATTEMPTS).each do
+          adapter = first_active_adapter
+          begin
+            return adapter.send method, *args, &block
+          rescue Exception => e
+            # On failure, check to see if the adapter is even active.  If it isn't, try again on next active adapter.
+            raise e if adapter.active?
+            @first_active_adapter = nil
+          end
         end
+      end
+
+      # Mixes in connect_with_failover to adapter class
+      def self.mixin_adapter_class_with_failover(klass)
+        # Make sure and only patch once 
+        unless klass.method_defined? :connect_with_failover
+          klass.class_eval do
+            def connect_with_failover
+              connect_without_failover
+            rescue Exception => e
+              @logger.error(e) if @logger
+            end
+            alias_method_chain :connect, :failover
+          end
+        end
+        klass
       end
     
       # Load given adapter type(s) and mixin connect_with_failover.
@@ -92,19 +100,7 @@ module ActiveRecord
       def self.load_adapter_classes_with_failover(*types)
         types.flatten.map do |type|
           require klass = "active_record/connection_adapters/#{type}_adapter"
-          klass.camelize.constantize.tap do |k|
-            # Make sure and only patch once 
-            unless k.method_defined? :connect_with_failover
-              k.class_eval do
-                def connect_with_failover
-                  connect_without_failover
-                rescue Exception => e
-                  @logger.error(e) if @logger
-                end
-                alias_method_chain :connect, :failover
-              end
-            end
-          end
+          mixin_adapter_class_with_failover(klass.camelize.constantize)
         end
       end
     
@@ -117,9 +113,8 @@ module ActiveRecord
         end.flatten.uniq.sort
       end
     
-      # Creates a new instance of FailoverAdapter with proxy methods based on the given adapter types.
-      # A block is expected which should return an array of adapter instances.
-      def self.create_adapter(types, &block)
+      # Creates a new class of FailoverAdapter with proxy methods based on the given adapter types.
+      def self.create_adapter_class(types)
         adapter_classes = load_adapter_classes_with_failover(types)
         proxy_methods = all_methods(adapter_classes) - all_methods(self)
         Class.new(self) do
@@ -130,7 +125,23 @@ module ActiveRecord
               end
             END
           end
-        end.new(yield)
+        end
+      end
+
+      # Creates internal adapter instances for each host specified (using the corresponding type)
+      def self.establish_internal_connections(hosts, types, config)
+        hosts.zip(types).map do |host, type|
+          ActiveRecord::Base.send "#{type || types.first}_connection", config.dup.merge(:host => host)
+        end
+      end
+
+      # Creates a new instance of the Failover Adapter based on the given config
+      def self.establish_connection(config)
+        hosts, types = [:host, :failover_adapter].map { |k| config[k].split /[\s,]+/ }
+        create_adapter_class(types).new(
+          establish_internal_connections(hosts, types, config),
+          config[:failover_reconnect_timeout]
+        )
       end
 
     end
