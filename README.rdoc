@@ -1,0 +1,30 @@
+Failover Adapter provides an ActiveRecord adapter that will utilize a primary connection so long as that connection remains active but will automatically failover to one or more alternative connections if that primary connection goes down.  After a period of 1 minute (and every minute thereafter) an attempt will be made to reconnect to any down connections.  If the primary connection successfully reconnects, the failover adapter will switch back to using it.
+
+= Simple Integration
+
+You can convert a standard Rails application (i.e. one that follows the scaffold conventions) to use the failover adapter by making three simple modifications to your database.yml file:
+
+1. Change :adapter config to "failover"
+2. Add :failover_adapter config to original value of :adapter (e.g. mysql)
+3. Modify :host config to specify multiple database servers (e.g. primary_host, alt_host1, alt_host2)
+
+= Configuration
+
+== failover_adapter
+
+The failover_adapter config can contain one or more adapter values.  Generally this should just be one adapter type, but in the event the failover connections use a different adapter than the primary, they can specified in the same order as hosts.
+
+== failover_reconnect_timeout
+
+You can modify the reconnect timeout by setting this config variable to duration in seconds.  The reconnect timeout determines the duration between attempts at reconnecting to an inactive connection.  By default the timeout is 60 (seconds).
+
+== Example configuration
+
+  production:
+    adapter: failover
+    failover_adapter: mysql
+    database: somedb_production
+    username: some_user
+    password: pass123
+    port: 3306
+    host: primary_host, alt_host1, alt_host2
